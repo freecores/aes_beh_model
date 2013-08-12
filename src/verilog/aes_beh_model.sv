@@ -41,19 +41,20 @@
 //// 																////
 ////////////////////////////////////////////////////////////////////////
 
-// This is a SystemVerilog implementation of the AES decryption algorithm
-// described in FIPS-197. Only decryption is implemented in this version.
-// The model is implemented as a SystemVerilog class which can be instantiated
-// in a testbench to generate known good results for verification of AES
-// decryption IPs. 
+// This is a SystemVerilog implementation of the AES encryption/decryption
+// algorithm described in FIPS-197. The model is implemented as a SystemVerilog
+// class which can be instantiated in a testbench to generate known good
+// results for verification of AES IPs. 
 // 
-// Try to use the typdefs at the end of this file instead of the class
-// below while declaring variables for the aes model in your testbench.
+// You are encouraged to use the typdefs at the end of this file instead of the
+// class below while declaring variables for the aes model in your testbench.
 //
 // Refer to the specification document on how to use the model in your
 // testbench.
 
-class aes_decrypt_model #(int Nk=4, int Nr=10);
+typedef enum {encrypt, decrypt} aes_func;
+
+class aes_beh_model #(int Nk=4, int Nr=10, aes_func func=decrypt);
 	// Refer to section 5 fig.4 of FIPS-197 spec for definitions of Nk and Nr
 	//				
 	// Key length	Nk		Nr
@@ -80,11 +81,30 @@ class aes_decrypt_model #(int Nk=4, int Nr=10);
 	
 	task LoadCt(bit [0:127] ct);
 	// Populate state array with ciphertext and set loaded flag
-		for (int j=0; j<=3; j++)
-			for (int k=0; k<=3; k++) state[k][j] = ct[(32*j+8*k)+:8];
-		loaded = 1;
-		done = 0;
-		curr_round = Nr;	// Inverse cipher round counts down from Nr
+		if (func == decrypt)
+		begin
+			for (int j=0; j<=3; j++)
+				for (int k=0; k<=3; k++) state[k][j] = ct[(32*j+8*k)+:8];
+			loaded = 1;
+			done = 0;
+			curr_round = Nr;	// Inverse cipher round counts down from Nr
+		end
+		else
+			$display("#Info : aes_beh_model::LoadCt() cannot load ciphertext to encryptor.");
+	endtask
+	
+	task LoadPt(bit [0:127] pt);
+	// Populate state array with plaintext and set loaded flag
+		if (func == encrypt)
+		begin
+			for (int j=0; j<=3; j++)
+				for (int k=0; k<=3; k++) state[k][j] = pt[(32*j+8*k)+:8];
+			loaded = 1;
+			done = 0;
+			curr_round = 0;	// Cipher round counts up from 0
+		end
+		else
+			$display("#Info : aes_beh_model::LoadPt() cannot load plaintext to decryptor.");
 	endtask
 	
 	function bit [0:127] GetState;
@@ -241,12 +261,34 @@ class aes_decrypt_model #(int Nk=4, int Nr=10);
 			for (int k=0; k<=3; k++) state[j][k] = tmp_state[j][k];
 	endtask
 
+	protected task ShiftRows;
+		byte unsigned tmp_state[1:3][0:3];	// Row 0 of state is not shifted
+		
+		for (int j=1; j<=3; j++)
+			for (int k=0; k<=3; k++) tmp_state[j][k] = state[j][(k+j)%4];
+	
+		for (int j=1; j<=3; j++)
+			for (int k=0; k<=3; k++) state[j][k] = tmp_state[j][k];
+	endtask
+	
 	protected function byte unsigned xtime(byte unsigned x);
 	// Multiplication by 2 over GF(256)
 	// Refer to FIPS-197 spec section 4.2.1 on definition of GF(256) multiplication
 		xtime = (x[7])? (x<<1) ^ 8'h1b : x<<1;
 	endfunction
 
+	protected function byte unsigned GFmul2(byte unsigned x);
+	// Same as xtime(). For improved readibility only.
+		GFmul2 = xtime(x);
+	endfunction
+	
+	protected function byte unsigned GFmul3(byte unsigned x);
+	// Multiply by 3 over GF(256)
+	// 3*x = 2*x + x
+	// Addition over GF(256) is xor
+		GFmul3 = xtime(x) ^ x;
+	endfunction
+	
 	protected function byte unsigned GFmul4(byte unsigned x);
 	// Multiply by 4 over GF(256)
 	// 4*x = 2*(2*x)
@@ -284,6 +326,23 @@ class aes_decrypt_model #(int Nk=4, int Nr=10);
 		GFmule = GFmul8(x) ^ GFmul4(x) ^ xtime(x);
 	endfunction
 
+	protected task MixColumns;
+		byte unsigned tmp_col[0:3];
+
+		for (int j=0; j<=3; j++)
+		begin
+			tmp_col[0] = GFmul2(state[0][j]) ^ GFmul3(state[1][j]) ^ state[2][j] ^ state[3][j];
+			tmp_col[1] = state[0][j] ^ GFmul2(state[1][j]) ^ GFmul3(state[2][j]) ^ state[3][j];
+			tmp_col[2] = state[0][j] ^ state[1][j] ^ GFmul2(state[2][j]) ^ GFmul3(state[3][j]);
+			tmp_col[3] = GFmul3(state[0][j]) ^ state[1][j] ^ state[2][j] ^ GFmul2(state[3][j]);
+		
+			state[0][j] = tmp_col[0];
+			state[1][j] = tmp_col[1];
+			state[2][j] = tmp_col[2];
+			state[3][j] = tmp_col[3];
+		end
+	endtask
+
 	protected task InvMixColumns;
 		byte unsigned tmp_col[0:3];
 
@@ -300,21 +359,28 @@ class aes_decrypt_model #(int Nk=4, int Nr=10);
 			state[3][j] = tmp_col[3];
 		end
 	endtask
-
+	
 	protected task AddRoundKey;
 		for (int j=0; j<=3; j++)
 			for (int k=0; k<=3; k++) state[k][j] ^= keysch[curr_round*4+j][k];
 	endtask
 
 	task run(int mode);
-	// Run inverse cipher rounds as defined in section 5.3 of FIPS-197 spec.
+	// Run cipher / inverse cipher rounds as defined in section 5.1 / 5.3 of FIPS-197 spec.
+	// Model functions as cipher / inverse cipher depending on the value of the parameter func.
+	//
+	// Two run modes are supported
 	// mode=0 -> Run from current round to completion
 	// mode=1 -> Run 1 round only
-	// Both LoadCt() and KeyExpand() must be called first before calling run()
-	// to ensure the inverse cipher doesn't work on garbage.
+	//
+	// For encryption both the LoadPt() and KeyExpand() must be called first before calling run().
+	// For dncryption both the LoadPt() and KeyExpand() must be called first before calling run().
+	// This is to ensure the cipher / inverse cipher doesn't work on garbage.
 	
-		// Only continue if ciphertext is loaded and there are unfinished round(s)
+		// Only continue if model is loaded and there are unfinished round(s)
 		if (loaded & ~done)
+		begin
+			if (func == decrypt) // Model configured as decryptor
 			do
 			begin
 				unique if (curr_round == Nr)
@@ -383,8 +449,82 @@ class aes_decrypt_model #(int Nk=4, int Nr=10);
 			end
 			while (done == 0);
 			
+			else
+			// Model configured as encryptor
+			do
+			begin
+				unique if (curr_round == 0)
+				begin
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].input\t%h",curr_round,GetState);
+					$display("round[%2d].k_sch\t%h",curr_round,GetCurrKsch);
+					`endif
+					
+					done = 0;
+					AddRoundKey;
+					curr_round++;
+				end
+				else if ((curr_round <= Nr-1) && (curr_round >= 1))
+				begin
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].start\t%h",curr_round,GetState);
+					`endif
+					
+					SubBytes;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].s_box\t%h",curr_round,GetState);
+					`endif
+					
+					ShiftRows;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].s_row\t%h",curr_round,GetState);
+					`endif
+					
+					MixColumns;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].m_col\t%h",curr_round,GetState);
+					`endif
+					
+					AddRoundKey;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].k_sch\t%h",curr_round,GetCurrKsch);
+					`endif
+					
+					curr_round++;
+				end
+				else if (curr_round == Nr)
+				begin
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].start\t%h",curr_round,GetState);
+					`endif
+					
+					SubBytes;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].s_box\t%h",curr_round,GetState);
+					`endif
+					
+					ShiftRows;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].s_row\t%h",curr_round,GetState);
+					`endif
+					
+					AddRoundKey;
+					`ifdef INTERNAL_DEBUG
+					$display("round[%2d].k_sch\t%h",curr_round,GetCurrKsch);
+					$display("round[%2d].output\t%h",curr_round,GetState);
+					`endif
+					
+					done = 1;	// Last round completed
+					loaded = 0;
+				end
+
+				if (mode == 1) break;
+			end
+			while (done == 0);
+		
+		end
 		// Either ciphertext is not loaded or decryption has already completed	
-		else $display("#Info : aes_decrypt_model::run() has nothing to do");
+		else $display("#Info : aes_beh_model::run() has nothing to do");
 	endtask
 endclass	// aes_decrypt_model
 
@@ -399,6 +539,10 @@ endclass	// aes_decrypt_model
 //		my_aes_descryptor.run(0);
 //		pt = my_aes_descryptor.GetState();
 
-typedef aes_decrypt_model #(.Nk(8),.Nr(14)) aes256_decrypt_t;
-typedef aes_decrypt_model #(.Nk(6),.Nr(12)) aes192_decrypt_t;
-typedef aes_decrypt_model #(.Nk(4),.Nr(10)) aes128_decrypt_t;
+typedef aes_beh_model #(.Nk(8),.Nr(14),.func(decrypt)) aes256_decrypt_t;
+typedef aes_beh_model #(.Nk(6),.Nr(12),.func(decrypt)) aes192_decrypt_t;
+typedef aes_beh_model #(.Nk(4),.Nr(10),.func(decrypt)) aes128_decrypt_t;
+
+typedef aes_beh_model #(.Nk(8),.Nr(14),.func(encrypt)) aes256_encrypt_t;
+typedef aes_beh_model #(.Nk(6),.Nr(12),.func(encrypt)) aes192_encrypt_t;
+typedef aes_beh_model #(.Nk(4),.Nr(10),.func(encrypt)) aes128_encrypt_t;
